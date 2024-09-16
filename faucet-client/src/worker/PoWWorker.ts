@@ -1,12 +1,16 @@
-import { IPoWParams } from "../common/IFaucetConfig";
-import { Scrypt } from "../../../libs/scrypt_wasm";
+import { getPoWParamsStr } from "../utils/PoWParamsHelper";
+import { PoWParams } from "../common/FaucetConfig";
 import { base64ToHex } from "../utils/ConvertHelpers";
 
+export type PoWWorkerHashFn = (nonceHex: string, preimgHex: string, params: PoWParams) => string;
+
 export interface IPoWWorkerOptions {
-  scrypt: Scrypt;
+  hashFn: PoWWorkerHashFn;
 }
 
-interface IPoWWorkerParams extends IPoWParams {
+interface IPoWWorkerParams {
+  params: PoWParams;
+  difficulty: number;
   dmask: string;
   pstr: string;
 }
@@ -21,6 +25,7 @@ export class PoWWorker {
   private options: IPoWWorkerOptions;
   private workerId: number;
   private powParams: IPoWWorkerParams;
+  private powDifficulty: number;
   private powPreImage: string;
   private working = false;
   private workNonce: number;
@@ -60,7 +65,7 @@ export class PoWWorker {
 
   private onCtrlSetWork(data: any) {
     this.workerId = data.workerid;
-    this.powParams = this.getWorkerParams(data.params);
+    this.powParams = this.getWorkerParams(data.params, data.difficulty);
     this.powPreImage = base64ToHex(data.preimage);
     this.nonceRanges = [{
       first: data.nonceStart,
@@ -83,7 +88,7 @@ export class PoWWorker {
   }
 
   private onCtrlSetParams(data: any) {
-    this.powParams = this.getWorkerParams(data);
+    this.powParams = this.getWorkerParams(data.params, data.difficulty);
   }
 
   private onCtrlVerify(share: any) {
@@ -91,13 +96,10 @@ export class PoWWorker {
 
     let isValid = (share.nonces.length > 0);
     for(var i = 0; i < share.nonces.length && isValid; i++) {
-      let nonceHex = share.nonces[i].toString(16);
-      if((nonceHex.length % 2) == 1) {
-        nonceHex = `0${nonceHex}`;
-      }
-
-      if(!this.checkHash(nonceHex, preimg))
+      if(!this.checkHash(share.nonces[i], preimg)) {
         isValid = false;
+        break;
+      }
     }
 
     postMessage({
@@ -109,11 +111,13 @@ export class PoWWorker {
     });
   }
 
-  private getWorkerParams(params: IPoWParams): IPoWWorkerParams {
-    let workerParams: IPoWWorkerParams = Object.assign(params, {
-      dmask: this.getDifficultyMask(params.d),
-      pstr: this.getPoWParamsStr(params),
-    });
+  private getWorkerParams(params: PoWParams, difficulty: number): IPoWWorkerParams {
+    let workerParams: IPoWWorkerParams = {
+      params: params,
+      difficulty: difficulty,
+      dmask: this.getDifficultyMask(difficulty),
+      pstr: getPoWParamsStr(params, difficulty),
+    };
 
     return workerParams;
   }
@@ -129,10 +133,6 @@ export class PoWWorker {
     }
 
     return mask;
-  }
-
-  private getPoWParamsStr(params: IPoWParams): string {
-    return params.n + "|" + params.r + "|" + params.p + "|" + params.l + "|" + params.d;
   }
 
   private startWorkLoop() {
@@ -188,9 +188,7 @@ export class PoWWorker {
     let nonce = this.workNonce++;
     if(nonce >= this.nonceRanges[0].last) {
       this.nonceRanges.splice(0, 1);
-      if(rangeCount === 1) {
-        console.log("[PoWMiner] Ran out of nonce ranges!");
-      } else {
+      if(rangeCount !== 1) {
         this.workNonce = this.nonceRanges[0].first;
       }
     }
@@ -210,19 +208,13 @@ export class PoWWorker {
 
   private checkHash(nonce: number, preimg: string): string {
     let nonceHex = nonce.toString(16);
-    if((nonceHex.length % 2) == 1) {
-      nonceHex = `0${nonceHex}`;
+    // pad hex to 64bit (16 hex characters) to prevent re-hashing the same nonce multiple times
+    if(nonceHex.length < 16) {
+      nonceHex = "0000000000000000".substring(0, 16 - nonceHex.length) + nonceHex;
     }
     
     this.statsCount++;
-    let hashHex = this.options.scrypt(
-      nonceHex, 
-      preimg, 
-      this.powParams.n, 
-      this.powParams.r, 
-      this.powParams.p, 
-      this.powParams.l
-    );
+    let hashHex = this.options.hashFn(nonceHex, preimg, this.powParams.params);
 
     let startOfHash = hashHex.substring(0, this.powParams.dmask.length);
     return (startOfHash <= this.powParams.dmask) ? hashHex : null;

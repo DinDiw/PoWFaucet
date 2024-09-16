@@ -1,9 +1,12 @@
 import * as fs from 'fs'
-import * as path from 'path';
 import * as crypto from "crypto";
-import { faucetConfig } from '../common/FaucetConfig';
-import { PoWClient } from "../websock/PoWClient";
-import { PoWSession } from '../websock/PoWSession';
+import YAML from 'yaml';
+import { faucetConfig, resolveRelativePath } from '../config/FaucetConfig.js';
+import { isVersionLower } from '../utils/VersionCompare.js';
+import { FaucetSession } from '../session/FaucetSession.js';
+import { ServiceManager } from '../common/ServiceManager.js';
+import { FaucetLogLevel, FaucetProcess } from '../common/FaucetProcess.js';
+import { SessionManager } from '../session/SessionManager.js';
 
 export enum FaucetStatusLevel {
   INFO    = "info",
@@ -13,94 +16,185 @@ export enum FaucetStatusLevel {
 
 export interface IFaucetStatus {
   level: FaucetStatusLevel;
+  prio: number;
   text: string;
   ishtml?: boolean;
 }
 
 export interface IFaucetStatusEntry extends IFaucetStatus {
   key?: string;
-  prio?: number;
   filter?: {
     session?: boolean;
     country?: string | string[];
     hosting?: boolean;
     proxy?: boolean;
+    lt_version?: string; // lower than version
+    gt_hashrate?: number; // higher than total hashrate
+
   };
 }
 
+interface IFaucetStatusCachedValue {
+  time: number;
+  value: any;
+}
+
+export interface IFaucetStatusConfig {
+  json?: string;
+  yaml?: string;
+  refresh?: number;
+}
+
 export class FaucetStatus {
+  private initialized: boolean;
+  private updateTimer: NodeJS.Timeout;
   private localStatusJson: string;
   private localStatusEntries: IFaucetStatusEntry[] = [];
   private currentStatus: {[key: string]: IFaucetStatusEntry} = {};
+  private statusValueCache: {[key: string]: IFaucetStatusCachedValue} = {};
 
-  public constructor() {
-    setInterval(() => this.updateLocalStatus(), 10000);
+  public initialize() {
+    if(this.initialized)
+      return;
+    this.initialized = true;
+
+    this.updateLocalStatus();
+    this.resetUpdateTimer();
+
+    ServiceManager.GetService(FaucetProcess).addListener("reload", () => this.resetUpdateTimer());
+  }
+
+  public dispose() {
+    this.initialized = false;
+    if(this.updateTimer) {
+      clearInterval(this.updateTimer);
+      this.updateTimer = null;
+    }
+  }
+
+  private resetUpdateTimer() {
+    if(this.updateTimer)
+      clearInterval(this.updateTimer);
+    this.updateTimer = setInterval(() => this.updateLocalStatus(), (faucetConfig.faucetStatus?.refresh || 10) * 1000);
   }
 
   private updateLocalStatus() {
-    let faucetStatusFile = path.join(faucetConfig.appBasePath, "faucet-status.json");
+    this.localStatusEntries = [];
+
+    let faucetStatusJsonFile = faucetConfig.faucetStatus?.json ? resolveRelativePath(faucetConfig.faucetStatus.json) : null;
+    let faucetStatusYamlFile = faucetConfig.faucetStatus?.yaml ? resolveRelativePath(faucetConfig.faucetStatus.yaml) : null;
     let faucetStatusStr = "";
-    if(!fs.existsSync(faucetStatusFile))
-      this.localStatusEntries = [];
-    else {
+
+    if(faucetStatusJsonFile && fs.existsSync(faucetStatusJsonFile)) {
       try {
-        faucetStatusStr = fs.readFileSync(faucetStatusFile, "utf8");
-        let faucetStatusJson = JSON.parse(faucetStatusStr);
+        let faucetStatusJsonStr = fs.readFileSync(faucetStatusJsonFile, "utf8");
+        let faucetStatusJson = JSON.parse(faucetStatusJsonStr);
+        faucetStatusStr += faucetStatusJsonStr;
 
         if(typeof faucetStatusJson === "string")
-          this.localStatusEntries = [{ level: FaucetStatusLevel.INFO, text: faucetStatusJson }];
+          this.localStatusEntries.push({ level: FaucetStatusLevel.INFO, text: faucetStatusJson, prio: 10 });
         else if(typeof faucetStatusJson === "object" && faucetStatusJson && faucetStatusJson.text)
-          this.localStatusEntries = [ faucetStatusJson ];
+          this.localStatusEntries.push(faucetStatusJson);
         else if(typeof faucetStatusJson === "object" && Array.isArray(faucetStatusJson))
-          this.localStatusEntries = faucetStatusJson;
-        else
-          this.localStatusEntries = [];
+          Array.prototype.push.apply(this.localStatusEntries, faucetStatusJson);
       } catch(ex) {
-        console.error("cannot read local faucet status: ", ex);
-        this.localStatusEntries = [];
+        ServiceManager.GetService(FaucetProcess).emitLog(FaucetLogLevel.WARNING, "cannot read local faucet statu from json: " + ex.toString());
       }
     }
-    if(faucetStatusStr !== this.localStatusJson) {
 
+    if(faucetStatusYamlFile && fs.existsSync(faucetStatusYamlFile)) {
+      try {
+        let faucetStatusYamlStr = fs.readFileSync(faucetStatusYamlFile, "utf8");
+        let faucetStatusYaml = YAML.parse(faucetStatusYamlStr);
+        faucetStatusStr += faucetStatusYamlStr;
+
+        if(typeof faucetStatusYaml === "string")
+          this.localStatusEntries.push({ level: FaucetStatusLevel.INFO, text: faucetStatusYaml, prio: 10 });
+        else if(typeof faucetStatusYaml === "object" && faucetStatusYaml && faucetStatusYaml.text)
+          this.localStatusEntries.push(faucetStatusYaml);
+        else if(typeof faucetStatusYaml === "object" && Array.isArray(faucetStatusYaml))
+          Array.prototype.push.apply(this.localStatusEntries, faucetStatusYaml);
+      } catch(ex) {
+        ServiceManager.GetService(FaucetProcess).emitLog(FaucetLogLevel.WARNING, "cannot read local faucet status from yaml: " + ex.toString());
+      }
+    }
+
+    if(faucetStatusStr !== this.localStatusJson) {
       this.updateFaucetStatus();
     }
   }
 
-  public setFaucetStatus(key: string, statusText: string, statusLevel: FaucetStatusLevel) {
+  public setFaucetStatus(key: string, statusText: string, statusLevel: FaucetStatusLevel, prio?: number): IFaucetStatusEntry {
     if(statusText) {
-      if(this.currentStatus[key] && this.currentStatus[key].text === statusText)
-        return;
-      this.currentStatus[key] = {key: key, text: statusText, level: statusLevel};
+      if(!this.currentStatus[key] || this.currentStatus[key].text !== statusText) {
+        this.currentStatus[key] = {key: key, text: statusText, level: statusLevel, prio: prio || 10};
+      }
     }
-    else {
-      if(!this.currentStatus[key])
-        return;
+    else if(this.currentStatus[key]) {
       delete this.currentStatus[key];
     }
-    this.updateFaucetStatus();
+    setImmediate(() => this.updateFaucetStatus());
+    return this.currentStatus[key];
   }
 
   private updateFaucetStatus() {
     // update faucet status for each client
-    let noSessionStatus: {status: IFaucetStatus[], hash: string} = null;
-    PoWClient.getAllClients().forEach((client) => {
-      let session = client.getSession();
-      let status = (!session && noSessionStatus) ? noSessionStatus : this.getFaucetStatus(session);
-      if(!session && !noSessionStatus)
-        noSessionStatus = status;
-      client.sendFaucetStatus(status.status, status.hash);
-    });
+
   }
 
-  public getFaucetStatus(session?: PoWSession): {status: IFaucetStatus[], hash: string} {
+  private getCachedValue(key: string, timeout: number, getter: () => any): any {
+    let cachedValue: IFaucetStatusCachedValue;
+    let now = Math.floor((new Date()).getTime() / 1000);
+    if((cachedValue = this.statusValueCache[key]) && cachedValue.time > now - timeout) {
+      return cachedValue.value;
+    }
+
+    let value = getter();
+    this.statusValueCache[key] = {
+      time: now,
+      value: value,
+    };
+    return value;
+  }
+
+  private getWellKnownValue(key: string): any {
+    switch(key) {
+      case "hashrate":
+        return this.getCachedValue(key, 60, () => {
+          let sessionManager = ServiceManager.GetService(SessionManager);
+          let totalHashrate = 0;
+          sessionManager.getActiveSessions().forEach((session) => {
+            totalHashrate += session.getSessionData("pow.hashrate", 0);
+          });
+          return totalHashrate;
+        });
+      
+    }
+  }
+
+  public getFaucetStatus(clientVersion?: string, session?: FaucetSession): {status: IFaucetStatus[], hash: string} {
     let statusList: IFaucetStatus[] = [];
     let statusHash = crypto.createHash("sha256");
 
     let addStatus = (status: IFaucetStatusEntry) => {
-      statusHash.update((status.key || "*") + ":" + status.text + "\n");
+      let text = status.text.replaceAll(/\{([a-z]+)\}/g, (match, key) => {
+        switch(key) {
+          case "hashrate":
+            let hashrate = this.getWellKnownValue("hashrate");
+            if(hashrate > 2000) {
+              return Math.floor(hashrate / 1000) + " kH/s";
+            } else {
+              return Math.floor(hashrate) + " H/s";
+            }
+        }
+        return match;
+      })
+
+      statusHash.update((status.key || "*") + ":" + text + "\n");
       statusList.push({
         level: status.level,
-        text: status.text,
+        prio: status.prio,
+        text: text,
         ishtml: status.ishtml
       });
     };
@@ -110,7 +204,7 @@ export class FaucetStatus {
       if(status.filter.session !== undefined && status.filter.session !== !!session)
         return false;
       
-      let ipinfo = session ? session.getLastIpInfo() : null;
+      let ipinfo = session ? session.getSessionData("ipinfo.data") : null;
       if(status.filter.country !== undefined) {
         if(!ipinfo || !ipinfo.countryCode)
           return false;
@@ -122,9 +216,22 @@ export class FaucetStatus {
         return false;
       if(status.filter.proxy !== undefined && (!ipinfo || !!ipinfo.proxy !== status.filter.proxy))
         return false;
+      
+      if(status.filter.lt_version !== undefined) {
+        if(!clientVersion)
+          return false;
+        if(!isVersionLower(clientVersion, status.filter.lt_version))
+          return false;
+      }
+
+      if(status.filter.gt_hashrate !== undefined) {
+        let hashrate = this.getWellKnownValue("hashrate");
+        if(hashrate < status.filter.gt_hashrate)
+          return false;
+      }
+
       return true;
     };
-
 
     let statusKeys = Object.keys(this.currentStatus);
     for(let i = 0; i < statusKeys.length; i++) {
@@ -146,6 +253,22 @@ export class FaucetStatus {
     Object.values(localStatusDict).sort((a, b) => ((a.prio || 0) - (b.prio || 0))).forEach((status) => {
       addStatus(status);
     });
+
+    if(session) {
+      let restriction = session.getSessionModuleRef("ipinfo.restriction.data");
+      if(restriction) {
+        restriction.messages.forEach((message) => {
+          if(!message.notify)
+            return;
+          
+          addStatus({
+            level: (typeof message.notify === "string" ? message.notify as FaucetStatusLevel : FaucetStatusLevel.WARNING),
+            prio: 20,
+            text: message.text,
+          });
+        });
+      }
+    }
 
     return {
       status: statusList,

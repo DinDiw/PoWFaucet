@@ -8,7 +8,3 @@ export function base64ToHex(str) {
   }
   return result;
 }
-
-export function weiToEth(wei: number): number {
-  return wei / 1000000000000000000;
-}

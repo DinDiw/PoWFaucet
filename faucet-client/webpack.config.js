@@ -11,6 +11,8 @@ var debug = false;
 if(cliArgs['dev'])
   debug = true;
 
+var buildTime = (new Date()).getTime();
+
 var webpackModuleConfigs = [
   {
     entry: './src/main',
@@ -21,8 +23,8 @@ var webpackModuleConfigs = [
     module: {
       rules: [
         {
-          test: /\.css$/,
-          use: [MiniCssExtractPlugin.loader, 'css-loader']
+          test: /\.s?css$/,
+          use: [MiniCssExtractPlugin.loader, 'css-loader', 'sass-loader']
         }
       ]
     },
@@ -35,10 +37,24 @@ var webpackModuleConfigs = [
     ]
   },
   {
-    entry: './src/worker',
+    entry: './src/worker/worker-scrypt',
     output: {
       path: path.join(__dirname, '/dist'),
-      filename: 'powfaucet-worker.js',
+      filename: 'powfaucet-worker-sc.js',
+    },
+  },
+  {
+    entry: './src/worker/worker-cryptonight',
+    output: {
+      path: path.join(__dirname, '/dist'),
+      filename: 'powfaucet-worker-cn.js',
+    },
+  },
+  {
+    entry: './src/worker/worker-argon2',
+    output: {
+      path: path.join(__dirname, '/dist'),
+      filename: 'powfaucet-worker-a2.js',
     },
 
   },
@@ -84,7 +100,12 @@ var webpackBaseConfig = {
     minimizer: [
       new TerserPlugin({
         parallel: true,
-        extractComments: true,
+        extractComments: {
+          banner: '@pow-faucet-client: ' + JSON.stringify({
+            version: pkgJson.version,
+            build: buildTime,
+          }) + "\n",
+        },
         terserOptions: {
           compress: true,
           keep_fnames: false,
@@ -99,7 +120,7 @@ var webpackBaseConfig = {
   plugins: [
     new webpack.DefinePlugin({
       FAUCET_CLIENT_VERSION: JSON.stringify(pkgJson.version),
-      FAUCET_CLIENT_BUILDTIME: (new Date()).getTime(),
+      FAUCET_CLIENT_BUILDTIME: buildTime,
     }),
     new Visualizer({
       filename: 'webpack-stats.html'
